@@ -6,6 +6,8 @@
 # Output files
 report.md
 *_report.md
+report.csv
+*_report.csv
 
 # Build artifacts
 clickhouse_verify

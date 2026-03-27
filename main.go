@@ -17,7 +17,10 @@ import (
 const defaultOutputFile = "report.md"
 
 type TableReport struct {
+	Cluster        string
+	Database       string
 	Name           string
+	Engine         string
 	TTL            string
 	SizeBytes      uint64
 	TotalRows      uint64
@@ -27,6 +30,7 @@ type TableReport struct {
 
 func main() {
 	outputFile := flag.String("output", defaultOutputFile, "Output file path for the report")
+	complete := flag.Bool("complete", false, "Include column count and rows per minute (slower)")
 	flag.Parse()
 
 	if err := godotenv.Load(); err != nil {
@@ -63,89 +67,134 @@ func main() {
 	}
 	log.Println("Connected to ClickHouse successfully")
 
-	report, err := generateReport(ctx, conn, database)
+	clusters, err := getClusters(ctx, conn)
+	if err != nil {
+		log.Fatalf("Failed to get clusters: %v", err)
+	}
+	log.Printf("Found %d clusters: %v", len(clusters), clusters)
+
+	report, err := generateReport(ctx, conn, database, clusters, *complete)
 	if err != nil {
 		log.Fatalf("Failed to generate report: %v", err)
 	}
 
 	log.Printf("Writing report to %s", *outputFile)
-	if err := writeReport(report, *outputFile); err != nil {
+	if err := writeReport(report, *outputFile, *complete); err != nil {
 		log.Fatalf("Failed to write report: %v", err)
 	}
 
 	log.Printf("Report generated successfully: %s", *outputFile)
 }
 
-func generateReport(ctx context.Context, conn clickhouse.Conn, database string) ([]TableReport, error) {
-	log.Println("Querying table list from system.tables")
+func getClusters(ctx context.Context, conn clickhouse.Conn) ([]string, error) {
+	log.Println("Querying clusters from system.clusters")
 
-	query := `
-		SELECT
-			name,
-			total_rows,
-			total_bytes,
-			engine_full
-		FROM system.tables
-		WHERE database = ?
-		AND engine NOT IN ('View', 'MaterializedView', 'Dictionary')
-		ORDER BY name
-	`
+	query := `SELECT DISTINCT cluster FROM system.clusters ORDER BY cluster`
 
-	rows, err := conn.Query(ctx, query, database)
+	rows, err := conn.Query(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query tables: %w", err)
+		return nil, fmt.Errorf("failed to query clusters: %w", err)
 	}
 	defer rows.Close()
 
+	var clusters []string
+	for rows.Next() {
+		var cluster string
+		if err := rows.Scan(&cluster); err != nil {
+			return nil, fmt.Errorf("failed to scan cluster: %w", err)
+		}
+		clusters = append(clusters, cluster)
+	}
+
+	return clusters, rows.Err()
+}
+
+func generateReport(ctx context.Context, conn clickhouse.Conn, database string, clusters []string, complete bool) ([]TableReport, error) {
+	log.Println("Querying table list from system.tables using clusterAllReplicas")
+
 	var reports []TableReport
 
-	for rows.Next() {
-		var name string
-		var totalRows *uint64
-		var totalBytes *uint64
-		var engineFull string
+	for _, cluster := range clusters {
+		log.Printf("Processing cluster: %s", cluster)
 
-		if err := rows.Scan(&name, &totalRows, &totalBytes, &engineFull); err != nil {
-			return nil, fmt.Errorf("failed to scan row: %w", err)
-		}
+		query := `
+			SELECT
+				database,
+				name,
+				engine,
+				total_rows,
+				total_bytes,
+				engine_full
+			FROM clusterAllReplicas(?, system.tables)
+			WHERE database = ?
+			ORDER BY name
+		`
 
-		log.Printf("Processing table: %s", name)
-
-		var rowsVal uint64
-		var bytesVal uint64
-		if totalRows != nil {
-			rowsVal = *totalRows
-		}
-		if totalBytes != nil {
-			bytesVal = *totalBytes
-		}
-
-		ttl := extractTTL(engineFull)
-
-		log.Printf("  - Getting column count for %s", name)
-		colCount, err := getColumnCount(ctx, conn, database, name)
+		rows, err := conn.Query(ctx, query, cluster, database)
 		if err != nil {
-			log.Printf("  - Warning: failed to get column count for %s: %v", name, err)
+			log.Printf("Warning: failed to query tables for cluster %s: %v", cluster, err)
+			continue
 		}
+		defer rows.Close()
 
-		log.Printf("  - Calculating rows per minute for %s", name)
-		rowsPerMin, err := getRowsPerMinute(ctx, conn, database, name)
-		if err != nil {
-			log.Printf("  - Warning: failed to get rows per minute for %s: %v", name, err)
+		for rows.Next() {
+			var db, name, engine string
+			var totalRows *uint64
+			var totalBytes *uint64
+			var engineFull string
+
+			if err := rows.Scan(&db, &name, &engine, &totalRows, &totalBytes, &engineFull); err != nil {
+				log.Printf("Warning: failed to scan row: %v", err)
+				continue
+			}
+
+			log.Printf("Processing table: %s.%s (%s)", db, name, engine)
+
+			var rowsVal uint64
+			var bytesVal uint64
+			if totalRows != nil {
+				rowsVal = *totalRows
+			}
+			if totalBytes != nil {
+				bytesVal = *totalBytes
+			}
+
+			ttl := extractTTL(engineFull)
+
+			var colCount uint64
+			var rowsPerMin float64
+
+			if complete {
+				log.Printf("  - Getting column count for %s", name)
+				colCount, err = getColumnCount(ctx, conn, database, name)
+				if err != nil {
+					log.Printf("  - Warning: failed to get column count for %s: %v", name, err)
+				}
+
+				log.Printf("  - Calculating rows per minute for %s", name)
+				rowsPerMin, err = getRowsPerMinute(ctx, conn, database, name)
+				if err != nil {
+					log.Printf("  - Warning: failed to get rows per minute for %s: %v", name, err)
+				}
+			}
+
+			reports = append(reports, TableReport{
+				Cluster:       cluster,
+				Database:      db,
+				Name:          name,
+				Engine:        engine,
+				TTL:           ttl,
+				SizeBytes:     bytesVal,
+				TotalRows:     rowsVal,
+				ColumnCount:   colCount,
+				RowsPerMinute: rowsPerMin,
+			})
 		}
-
-		reports = append(reports, TableReport{
-			Name:          name,
-			TTL:           ttl,
-			SizeBytes:     bytesVal,
-			TotalRows:     rowsVal,
-			ColumnCount:   colCount,
-			RowsPerMinute: rowsPerMin,
-		})
+		rows.Close()
 	}
 
 	log.Printf("Processed %d tables", len(reports))
-	return reports, rows.Err()
+	return reports, nil
 }
 
 func extractTTL(engineFull string) string {
@@ -158,15 +207,39 @@ func extractTTL(engineFull string) string {
 	ttlPart := engineFull[idx+3:]
 	ttlPart = strings.TrimSpace(ttlPart)
 
-	endChars := []string{",", ")"}
-	endIdx := len(ttlPart)
-	for _, c := range endChars {
-		if i := strings.Index(ttlPart, c); i != -1 && i < endIdx {
+	// Find the end of TTL expression by counting parentheses
+	// TTL expression ends when we reach a comma or closing paren at depth 0
+	parenDepth := 0
+	endIdx := -1
+
+	for i, ch := range ttlPart {
+		if ch == '(' {
+			parenDepth++
+		} else if ch == ')' {
+			parenDepth--
+			if parenDepth < 0 {
+				// Found closing paren at depth 0, end here (don't include this paren)
+				endIdx = i
+				break
+			}
+		} else if ch == ',' && parenDepth == 0 {
+			// Found comma at depth 0, end here
 			endIdx = i
+			break
 		}
 	}
 
-	ttlExpr := strings.TrimSpace(ttlPart[:endIdx])
+	var ttlExpr string
+	if endIdx != -1 {
+		ttlExpr = strings.TrimSpace(ttlPart[:endIdx])
+	} else {
+		// No end delimiter found, take entire expression
+		ttlExpr = strings.TrimSpace(ttlPart)
+	}
+
+	// Remove trailing closing paren if it got included
+	ttlExpr = strings.TrimSuffix(ttlExpr, ")")
+
 	return ttlExpr
 }
 
@@ -229,7 +302,7 @@ func quoteIdent(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 
-func writeReport(reports []TableReport, filePath string) error {
+func writeReport(reports []TableReport, filePath string, complete bool) error {
 	file, err := os.Create(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
@@ -238,18 +311,77 @@ func writeReport(reports []TableReport, filePath string) error {
 
 	fmt.Fprintln(file, "# ClickHouse Table Report")
 	fmt.Fprintln(file, "")
-	fmt.Fprintln(file, "| TABLE NAME | TTL | SIZE (BYTES) | ROWS | COLUMNS | ROWS/MIN (10min avg) |")
-	fmt.Fprintln(file, "|------------|-----|--------------|------|---------|----------------------|")
+
+	if complete {
+		fmt.Fprintln(file, "| CLUSTER | DATABASE | TABLE NAME | ENGINE | TTL | SIZE (BYTES) | ROWS | COLUMNS | ROWS/MIN (10min avg) |")
+		fmt.Fprintln(file, "|---------|----------|------------|--------|-----|--------------|------|---------|----------------------|")
+	} else {
+		fmt.Fprintln(file, "| CLUSTER | DATABASE | TABLE NAME | ENGINE | TTL | SIZE (BYTES) | ROWS |")
+		fmt.Fprintln(file, "|---------|----------|------------|--------|-----|--------------|------|")
+	}
 
 	for _, r := range reports {
-		fmt.Fprintf(file, "| %s | %s | %d | %d | %d | %.2f |\n",
-			r.Name,
-			r.TTL,
-			r.SizeBytes,
-			r.TotalRows,
-			r.ColumnCount,
-			r.RowsPerMinute,
-		)
+		if complete {
+			fmt.Fprintf(file, "| %s | %s | %s | %s | %s | %d | %d | %d | %.2f |\n",
+				r.Cluster,
+				r.Database,
+				r.Name,
+				r.Engine,
+				r.TTL,
+				r.SizeBytes,
+				r.TotalRows,
+				r.ColumnCount,
+				r.RowsPerMinute,
+			)
+		} else {
+			fmt.Fprintf(file, "| %s | %s | %s | %s | %s | %d | %d |\n",
+				r.Cluster,
+				r.Database,
+				r.Name,
+				r.Engine,
+				r.TTL,
+				r.SizeBytes,
+				r.TotalRows,
+			)
+		}
+	}
+
+	// Write CSV file
+	csvPath := strings.TrimSuffix(filePath, ".md") + ".csv"
+	csvFile, err := os.Create(csvPath)
+	if err != nil {
+		return fmt.Errorf("failed to create CSV file: %w", err)
+	}
+	defer csvFile.Close()
+
+	if complete {
+		fmt.Fprintln(csvFile, "CLUSTER,DATABASE,TABLE NAME,ENGINE,TTL,SIZE (BYTES),ROWS,COLUMNS,ROWS/MIN (10min avg)")
+		for _, r := range reports {
+			fmt.Fprintf(csvFile, "%s,%s,%s,%s,%s,%d,%d,%d,%.2f\n",
+				r.Cluster,
+				r.Database,
+				r.Name,
+				r.Engine,
+				r.TTL,
+				r.SizeBytes,
+				r.TotalRows,
+				r.ColumnCount,
+				r.RowsPerMinute,
+			)
+		}
+	} else {
+		fmt.Fprintln(csvFile, "CLUSTER,DATABASE,TABLE NAME,ENGINE,TTL,SIZE (BYTES),ROWS")
+		for _, r := range reports {
+			fmt.Fprintf(csvFile, "%s,%s,%s,%s,%s,%d,%d\n",
+				r.Cluster,
+				r.Database,
+				r.Name,
+				r.Engine,
+				r.TTL,
+				r.SizeBytes,
+				r.TotalRows,
+			)
+		}
 	}
 
 	return nil
